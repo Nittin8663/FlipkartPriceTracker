@@ -1,0 +1,6 @@
+flask==2.3.3
+beautifulsoup4==4.12.2
+requests==2.31.0
+python-telegram-bot==20.4
+fake-useragent==1.2.1
+pyngrok==7.0.0
