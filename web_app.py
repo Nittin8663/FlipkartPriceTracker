@@ -10,6 +10,8 @@ from bs4 import BeautifulSoup
 import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import random
+import json
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -18,8 +20,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants with your exact current time and login
-CURRENT_TIME = "2025-08-12 17:59:02"
+# Constants with exact current time and login
+CURRENT_TIME = "2025-08-12 18:04:14"
 USER_LOGIN = "Nittin8663"
 DATABASE_NAME = "price_history.db"
 PORT = 8000
@@ -31,108 +33,208 @@ tracking_state = {
     'current_data': None,
     'product_url': None,
     'threshold_price': None,
-    'telegram_config': None
+    'telegram_config': None,
+    'last_error': None
 }
 
 class PriceTracker:
     def __init__(self, url):
-        self.url = url
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+        self.url = self._clean_flipkart_url(url)
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ]
+        self.session = self._create_session()
+
+    def _clean_flipkart_url(self, url):
+        """Clean Flipkart URL to get essential parameters"""
+        try:
+            # Extract the product ID
+            pid_match = re.search(r'pid=([A-Z0-9]+)', url)
+            if pid_match:
+                pid = pid_match.group(1)
+                # Keep the original URL but remove tracking parameters
+                base_url = url.split('?')[0]
+                clean_url = f"{base_url}?pid={pid}"
+                logger.info(f"Cleaned URL: {clean_url}")
+                return clean_url
+            return url
+        except Exception as e:
+            logger.error(f"Error cleaning URL: {e}")
+            return url
+
+    def _create_session(self):
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=1.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=3,
+            pool_maxsize=10
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _get_headers(self):
+        return {
+            'User-Agent': random.choice(self.user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0',
-            'Sec-Fetch-Dest': 'document',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Site': 'same-origin',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1'
+            'Sec-Fetch-User': '?1',
+            'Sec-Fetch-Dest': 'document'
         }
-        # Setup session with retry strategy
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
 
-    def clean_price(self, price_text):
-        """Convert price text to float"""
+    def _extract_price_from_script(self, soup):
+        """Extract price from JSON-LD script tags"""
         try:
-            return float(re.sub(r'[^\d.]', '', price_text))
-        except ValueError:
-            logger.error(f"Error converting price: {price_text}")
-            raise ValueError(f"Invalid price format: {price_text}")
+            scripts = soup.find_all('script', type='application/ld+json')
+            for script in scripts:
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict):
+                        # Check for different JSON-LD structures
+                        if 'offers' in data:
+                            price = data['offers'].get('price')
+                        elif '@graph' in data:
+                            for item in data['@graph']:
+                                if 'offers' in item:
+                                    price = item['offers'].get('price')
+                                    if price:
+                                        return float(price)
+                        if price:
+                            return float(price)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        except Exception as e:
+            logger.error(f"Error extracting price from script: {e}")
+        return None
+
+    def _extract_price_from_html(self, soup):
+        """Extract price using multiple CSS selectors"""
+        price_selectors = [
+            'div._30jeq3._16Jk6d',
+            'div.CEmiEU div._30jeq3',
+            'div._16Jk6d',
+            'div._30jeq3',
+            'div.dyC4hf div._30jeq3',
+            'div.dyC4hf span._30jeq3'
+        ]
+        
+        for selector in price_selectors:
+            try:
+                element = soup.select_one(selector)
+                if element:
+                    price_text = element.text.strip()
+                    # Remove ₹ symbol and commas, then convert to float
+                    price = float(re.sub(r'[^\d.]', '', price_text))
+                    if price > 0:
+                        logger.info(f"Price found with selector {selector}: ₹{price:,.2f}")
+                        return price
+            except Exception as e:
+                logger.warning(f"Error with selector {selector}: {e}")
+                continue
+        return None
 
     def get_price(self):
-        max_retries = 3
-        retry_delay = 5
+        max_retries = 5
+        base_delay = 3
         last_error = None
         
         for attempt in range(max_retries):
             try:
+                # Add jitter to delay
+                delay = base_delay * (1.5 ** attempt) + random.uniform(0, 2)
+                if attempt > 0:
+                    logger.info(f"Attempt {attempt + 1}: Waiting {delay:.2f} seconds")
+                    time.sleep(delay)
+
+                # Make the request
                 response = self.session.get(
                     self.url,
-                    headers=self.headers,
-                    timeout=(5, 15),
+                    headers=self._get_headers(),
+                    timeout=(10, 20),
                     allow_redirects=True
                 )
                 response.raise_for_status()
                 
-                if 'Access Denied' in response.text or 'Captcha' in response.text:
-                    raise Exception("Access denied or captcha detected")
-                
+                # Log response status and content length
+                logger.info(f"Response status: {response.status_code}, Content length: {len(response.text)}")
+
+                # Check for anti-bot measures
+                if any(text in response.text.lower() for text in ['captcha', 'access denied', 'rate limit']):
+                    raise Exception("Detected anti-bot measure")
+
                 soup = BeautifulSoup(response.text, 'html.parser')
+
+                # Try to get price from JSON-LD first
+                price = self._extract_price_from_script(soup)
                 
+                # If JSON-LD fails, try HTML selectors
+                if not price:
+                    price = self._extract_price_from_html(soup)
+
+                if not price:
+                    raise ValueError("Price not found in page content")
+
                 # Get product title
-                title = soup.select_one('span.B_NuCI')
-                if not title:
-                    title = soup.select_one('h1.yhB1nd')  # Alternative title class
+                title_selectors = [
+                    'span.B_NuCI',
+                    'h1.yhB1nd',
+                    'h1._30jeq3',
+                    'div._30jeq3'
+                ]
+
+                title = None
+                for selector in title_selectors:
+                    title_elem = soup.select_one(selector)
+                    if title_elem:
+                        title = title_elem.text.strip()
+                        break
+
                 if not title:
                     raise ValueError("Product title not found")
-                title = title.text.strip()
 
-                # Get product price with multiple selectors
-                price_selectors = [
-                    'div._30jeq3._16Jk6d',
-                    'div.CEmiEU div._30jeq3',
-                    'div._16Jk6d'
-                ]
-                
-                price_elem = None
-                for selector in price_selectors:
-                    price_elem = soup.select_one(selector)
-                    if price_elem:
-                        break
-                        
-                if not price_elem:
-                    raise ValueError("Price element not found")
-                
-                price = self.clean_price(price_elem.text.strip())
-                
-                if price <= 0:
-                    raise ValueError("Invalid price value")
-                
+                # Log successful price fetch
+                logger.info(f"Successfully fetched price for '{title}': ₹{price:,.2f}")
+
                 return {
                     'title': title,
                     'price': price,
-                    'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                    'attempt': attempt + 1
                 }
-                
+
+            except requests.Timeout as e:
+                last_error = f"Timeout error on attempt {attempt + 1}: {str(e)}"
+                logger.warning(last_error)
+            except requests.ConnectionError as e:
+                last_error = f"Connection error on attempt {attempt + 1}: {str(e)}"
+                logger.warning(last_error)
+            except requests.RequestException as e:
+                last_error = f"Request error on attempt {attempt + 1}: {str(e)}"
+                logger.warning(last_error)
             except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay * (attempt + 1))
-                    continue
-                break
-                
-        raise Exception(f"Failed to fetch price after {max_retries} attempts. Last error: {last_error}")
+                last_error = f"Error on attempt {attempt + 1}: {str(e)}"
+                logger.warning(last_error)
+
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to fetch price after {max_retries} attempts")
+                raise Exception(f"Failed after {max_retries} attempts: {last_error}")
+
+        raise Exception(f"Failed to fetch price after {max_retries} attempts")
 
 class TelegramBot:
     def __init__(self, token, chat_id):
@@ -244,6 +346,7 @@ def price_tracking_thread():
             data = tracker.get_price()
             data['url'] = tracking_state['product_url']
             tracking_state['current_data'] = data
+            tracking_state['last_error'] = None
             
             store_price_data(data)
             
@@ -255,7 +358,9 @@ def price_tracking_thread():
             
         except Exception as e:
             consecutive_errors += 1
-            logger.error(f"Error in price tracking (attempt {consecutive_errors}): {e}")
+            error_msg = str(e)
+            tracking_state['last_error'] = error_msg
+            logger.error(f"Error in price tracking (attempt {consecutive_errors}): {error_msg}")
             
             if consecutive_errors >= max_consecutive_errors:
                 logger.error("Too many consecutive errors, stopping tracking")
@@ -291,7 +396,8 @@ def start_tracking():
                 'token': data['telegram_token'],
                 'chat_id': data['telegram_chat_id']
             },
-            'is_tracking': True
+            'is_tracking': True,
+            'last_error': None
         })
         
         if not tracking_state['tracker_thread'] or not tracking_state['tracker_thread'].is_alive():
@@ -335,7 +441,8 @@ def get_status():
         'is_tracking': tracking_state['is_tracking'],
         'current_data': tracking_state['current_data'],
         'product_url': tracking_state['product_url'],
-        'threshold_price': tracking_state['threshold_price']
+        'threshold_price': tracking_state['threshold_price'],
+        'last_error': tracking_state['last_error']
     })
 
 @app.route('/api/price_history')
