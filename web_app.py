@@ -5,6 +5,9 @@ import threading
 import time
 import logging
 from pyngrok import ngrok
+import requests
+from bs4 import BeautifulSoup
+import re
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -14,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants with your current time and login
-CURRENT_TIME = "2025-08-12 17:48:30"
+CURRENT_TIME = "2025-08-12 17:54:46"
 USER_LOGIN = "Nittin8663"
 DATABASE_NAME = "price_history.db"
 PORT = 8000
@@ -32,24 +35,85 @@ tracking_state = {
 class PriceTracker:
     def __init__(self, url):
         self.url = url
-        
-    def get_price(self):
-        """Simulate price tracking for testing"""
-        return {
-            'title': 'Test Product',
-            'price': 1000.0,
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
         }
+
+    def clean_price(self, price_text):
+        """Convert price text to float"""
+        try:
+            return float(re.sub(r'[^\d.]', '', price_text))
+        except ValueError:
+            logger.error(f"Error converting price: {price_text}")
+            raise ValueError(f"Invalid price format: {price_text}")
+
+    def get_price(self):
+        try:
+            response = requests.get(self.url, headers=self.headers, timeout=10)
+            response.raise_for_status()  # Raise exception for bad status codes
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Get product title
+            title = soup.select_one('span.B_NuCI')
+            if not title:
+                raise ValueError("Product title not found")
+            title = title.text.strip()
+
+            # Get product price
+            price_elem = soup.select_one('div._30jeq3._16Jk6d')
+            if not price_elem:
+                raise ValueError("Price element not found")
+            
+            price = self.clean_price(price_elem.text.strip())
+            
+            return {
+                'title': title,
+                'price': price,
+                'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            }
+        except requests.RequestException as e:
+            logger.error(f"Network error while fetching price: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error scraping price: {e}")
+            raise
 
 class TelegramBot:
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = chat_id
-        
+        self.api_url = f"https://api.telegram.org/bot{token}"
+
     def send_price_alert(self, data, threshold_price):
-        """Simulate sending telegram alert"""
-        logger.info(f"Price alert sent: {data['price']} <= {threshold_price}")
-        return True
+        """Send actual Telegram alert"""
+        try:
+            message = (
+                f"🔔 Price Alert!\n\n"
+                f"Product: {data['title']}\n"
+                f"Current Price: ₹{data['price']:,.2f}\n"
+                f"Target Price: ₹{threshold_price:,.2f}\n"
+                f"URL: {data['url']}\n\n"
+                f"Time: {data['timestamp']}"
+            )
+            
+            params = {
+                'chat_id': self.chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            
+            response = requests.post(f"{self.api_url}/sendMessage", params=params, timeout=10)
+            response.raise_for_status()
+            
+            logger.info(f"Price alert sent successfully: ₹{data['price']:,.2f} <= ₹{threshold_price:,.2f}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending Telegram alert: {e}")
+            return False
 
 def init_database():
     """Initialize SQLite database"""
@@ -75,7 +139,23 @@ def store_price_data(data):
     """Store price data in database"""
     try:
         with sqlite3.connect(DATABASE_NAME) as conn:
-            conn.execute('''
+            cursor = conn.cursor()
+            
+            # Get previous price
+            cursor.execute('''
+                SELECT price FROM price_history 
+                WHERE product_url = ? 
+                ORDER BY timestamp DESC LIMIT 1
+            ''', (tracking_state['product_url'],))
+            
+            prev_price = cursor.fetchone()
+            if prev_price:
+                price_change = data['price'] - prev_price[0]
+            else:
+                price_change = 0
+                
+            # Insert new price data
+            cursor.execute('''
                 INSERT INTO price_history 
                 (product_url, product_title, price, timestamp, threshold_price)
                 VALUES (?, ?, ?, ?, ?)
@@ -87,7 +167,8 @@ def store_price_data(data):
                 tracking_state['threshold_price']
             ))
             conn.commit()
-        logger.info(f"Price data stored: {data['price']}")
+            
+        logger.info(f"Price data stored: ₹{data['price']:,.2f} (Change: ₹{price_change:,.2f})")
     except Exception as e:
         logger.error(f"Error storing price data: {e}")
 
@@ -130,6 +211,11 @@ def start_tracking():
     
     try:
         data = request.get_json()
+        
+        # Validate URL
+        if not data['url'].startswith('https://www.flipkart.com'):
+            raise ValueError("Invalid Flipkart URL")
+            
         tracking_state.update({
             'product_url': data['url'],
             'threshold_price': float(data['threshold_price']),
@@ -153,12 +239,18 @@ def start_tracking():
             'message': 'Price tracking started successfully'
         })
         
-    except Exception as e:
-        logger.error(f"Failed to start tracking: {e}")
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
         return jsonify({
             'status': 'error',
             'message': str(e)
         }), 400
+    except Exception as e:
+        logger.error(f"Failed to start tracking: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': 'Internal server error'
+        }), 500
 
 @app.route('/api/stop_tracking')
 def stop_tracking():
@@ -184,7 +276,10 @@ def get_price_history():
         with sqlite3.connect(DATABASE_NAME) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute('''
-                SELECT * FROM price_history
+                SELECT 
+                    h.*,
+                    (h.price - LAG(h.price) OVER (ORDER BY timestamp)) as price_change
+                FROM price_history h
                 ORDER BY timestamp DESC
                 LIMIT 50
             ''')
