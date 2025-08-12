@@ -1,0 +1,86 @@
+/* Custom styles */
+body {
+    background-color: #f8f9fa;
+}
+
+.navbar {
+    box-shadow: 0 2px 4px rgba(0,0,0,.1);
+}
+
+.card {
+    box-shadow: 0 2px 4px rgba(0,0,0,.05);
+    border-radius: 10px;
+    border: none;
+    margin-bottom: 20px;
+}
+
+.card-title {
+    color: #2c3e50;
+    font-weight: 600;
+}
+
+.status-card {
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    transition: all 0.3s ease;
+}
+
+.status-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,.1);
+}
+
+.price-history {
+    height: 400px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+.price-history::-webkit-scrollbar {
+    width: 6px;
+}
+
+.price-history::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+.price-history::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 3px;
+}
+
+.btn {
+    border-radius: 5px;
+    padding: 8px 16px;
+    font-weight: 500;
+}
+
+.form-control {
+    border-radius: 5px;
+    border: 1px solid #dee2e6;
+    padding: 10px;
+}
+
+.form-control:focus {
+    box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+}
+
+.tracking-active {
+    color: #28a745;
+}
+
+.tracking-inactive {
+    color: #dc3545;
+}
+
+.price-change-up {
+    color: #dc3545;
+}
+
+.price-change-down {
+    color: #28a745;
+}
+
+.timestamp {
+    color: #6c757d;
+    font-size: 0.9em;
+}
