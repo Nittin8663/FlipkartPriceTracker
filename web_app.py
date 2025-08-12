@@ -8,6 +8,8 @@ from pyngrok import ngrok
 import requests
 from bs4 import BeautifulSoup
 import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -16,8 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants with your current time and login
-CURRENT_TIME = "2025-08-12 17:54:46"
+# Constants with your exact current time and login
+CURRENT_TIME = "2025-08-12 17:59:02"
 USER_LOGIN = "Nittin8663"
 DATABASE_NAME = "price_history.db"
 PORT = 8000
@@ -39,8 +41,25 @@ class PriceTracker:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1'
         }
+        # Setup session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def clean_price(self, price_text):
         """Convert price text to float"""
@@ -51,68 +70,108 @@ class PriceTracker:
             raise ValueError(f"Invalid price format: {price_text}")
 
     def get_price(self):
-        try:
-            response = requests.get(self.url, headers=self.headers, timeout=10)
-            response.raise_for_status()  # Raise exception for bad status codes
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Get product title
-            title = soup.select_one('span.B_NuCI')
-            if not title:
-                raise ValueError("Product title not found")
-            title = title.text.strip()
+        max_retries = 3
+        retry_delay = 5
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(
+                    self.url,
+                    headers=self.headers,
+                    timeout=(5, 15),
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                
+                if 'Access Denied' in response.text or 'Captcha' in response.text:
+                    raise Exception("Access denied or captcha detected")
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Get product title
+                title = soup.select_one('span.B_NuCI')
+                if not title:
+                    title = soup.select_one('h1.yhB1nd')  # Alternative title class
+                if not title:
+                    raise ValueError("Product title not found")
+                title = title.text.strip()
 
-            # Get product price
-            price_elem = soup.select_one('div._30jeq3._16Jk6d')
-            if not price_elem:
-                raise ValueError("Price element not found")
-            
-            price = self.clean_price(price_elem.text.strip())
-            
-            return {
-                'title': title,
-                'price': price,
-                'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        except requests.RequestException as e:
-            logger.error(f"Network error while fetching price: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error scraping price: {e}")
-            raise
+                # Get product price with multiple selectors
+                price_selectors = [
+                    'div._30jeq3._16Jk6d',
+                    'div.CEmiEU div._30jeq3',
+                    'div._16Jk6d'
+                ]
+                
+                price_elem = None
+                for selector in price_selectors:
+                    price_elem = soup.select_one(selector)
+                    if price_elem:
+                        break
+                        
+                if not price_elem:
+                    raise ValueError("Price element not found")
+                
+                price = self.clean_price(price_elem.text.strip())
+                
+                if price <= 0:
+                    raise ValueError("Invalid price value")
+                
+                return {
+                    'title': title,
+                    'price': price,
+                    'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                break
+                
+        raise Exception(f"Failed to fetch price after {max_retries} attempts. Last error: {last_error}")
 
 class TelegramBot:
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = chat_id
         self.api_url = f"https://api.telegram.org/bot{token}"
+        self.session = requests.Session()
 
     def send_price_alert(self, data, threshold_price):
-        """Send actual Telegram alert"""
         try:
             message = (
                 f"🔔 Price Alert!\n\n"
                 f"Product: {data['title']}\n"
                 f"Current Price: ₹{data['price']:,.2f}\n"
                 f"Target Price: ₹{threshold_price:,.2f}\n"
-                f"URL: {data['url']}\n\n"
-                f"Time: {data['timestamp']}"
+                f"Savings: ₹{(threshold_price - data['price']):,.2f}\n\n"
+                f"🛍️ Product URL:\n{data['url']}\n\n"
+                f"⏰ Time: {data['timestamp']}"
             )
             
             params = {
                 'chat_id': self.chat_id,
                 'text': message,
-                'parse_mode': 'HTML'
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': False
             }
             
-            response = requests.post(f"{self.api_url}/sendMessage", params=params, timeout=10)
+            response = self.session.post(
+                f"{self.api_url}/sendMessage",
+                params=params,
+                timeout=10
+            )
             response.raise_for_status()
             
-            logger.info(f"Price alert sent successfully: ₹{data['price']:,.2f} <= ₹{threshold_price:,.2f}")
+            logger.info(f"Price alert sent: ₹{data['price']:,.2f} <= ₹{threshold_price:,.2f}")
             return True
             
         except Exception as e:
-            logger.error(f"Error sending Telegram alert: {e}")
+            logger.error(f"Failed to send Telegram alert: {e}")
             return False
 
 def init_database():
@@ -126,7 +185,8 @@ def init_database():
                     product_title TEXT,
                     price REAL,
                     timestamp DATETIME,
-                    threshold_price REAL
+                    threshold_price REAL,
+                    price_change REAL
                 )
             ''')
             conn.commit()
@@ -149,22 +209,20 @@ def store_price_data(data):
             ''', (tracking_state['product_url'],))
             
             prev_price = cursor.fetchone()
-            if prev_price:
-                price_change = data['price'] - prev_price[0]
-            else:
-                price_change = 0
+            price_change = data['price'] - prev_price[0] if prev_price else 0
                 
             # Insert new price data
             cursor.execute('''
                 INSERT INTO price_history 
-                (product_url, product_title, price, timestamp, threshold_price)
-                VALUES (?, ?, ?, ?, ?)
+                (product_url, product_title, price, timestamp, threshold_price, price_change)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 tracking_state['product_url'],
                 data['title'],
                 data['price'],
                 data['timestamp'],
-                tracking_state['threshold_price']
+                tracking_state['threshold_price'],
+                price_change
             ))
             conn.commit()
             
@@ -178,24 +236,35 @@ def price_tracking_thread():
     tracker = PriceTracker(tracking_state['product_url'])
     telegram_bot = TelegramBot(**tracking_state['telegram_config'])
     
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     while tracking_state['is_tracking']:
         try:
             data = tracker.get_price()
             data['url'] = tracking_state['product_url']
             tracking_state['current_data'] = data
             
-            # Store in database
             store_price_data(data)
             
-            # Check price threshold
             if data['price'] <= tracking_state['threshold_price']:
                 telegram_bot.send_price_alert(data, tracking_state['threshold_price'])
             
-            time.sleep(60)  # Check every minute
+            consecutive_errors = 0
+            time.sleep(60)
             
         except Exception as e:
-            logger.error(f"Error in price tracking: {e}")
-            time.sleep(60)
+            consecutive_errors += 1
+            logger.error(f"Error in price tracking (attempt {consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("Too many consecutive errors, stopping tracking")
+                tracking_state['is_tracking'] = False
+                break
+                
+            sleep_time = min(60 * (2 ** (consecutive_errors - 1)), 300)
+            logger.info(f"Waiting {sleep_time} seconds before next attempt")
+            time.sleep(sleep_time)
 
     logger.info("Price tracking thread stopped")
 
@@ -212,7 +281,6 @@ def start_tracking():
     try:
         data = request.get_json()
         
-        # Validate URL
         if not data['url'].startswith('https://www.flipkart.com'):
             raise ValueError("Invalid Flipkart URL")
             
@@ -276,10 +344,8 @@ def get_price_history():
         with sqlite3.connect(DATABASE_NAME) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute('''
-                SELECT 
-                    h.*,
-                    (h.price - LAG(h.price) OVER (ORDER BY timestamp)) as price_change
-                FROM price_history h
+                SELECT *
+                FROM price_history
                 ORDER BY timestamp DESC
                 LIMIT 50
             ''')
@@ -302,21 +368,17 @@ def start_ngrok():
 
 if __name__ == '__main__':
     try:
-        # Print startup banner
         print("\n=== Flipkart Price Tracker ===")
         print(f"Time: {CURRENT_TIME}")
         print(f"User: {USER_LOGIN}")
         print("===========================\n")
         
-        # Initialize database
         init_database()
         
-        # Start ngrok in a separate thread
         ngrok_thread = threading.Thread(target=start_ngrok, daemon=True)
         ngrok_thread.start()
-        time.sleep(2)  # Wait for ngrok to start
+        time.sleep(2)
         
-        # Start Flask application
         logger.info(f"Starting Flask application on port {PORT}")
         app.run(host='0.0.0.0', port=PORT, debug=False)
         
